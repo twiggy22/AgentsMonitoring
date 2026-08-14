@@ -99,6 +99,16 @@ def _start(agent: dict, tmux_bin: str, recreate: bool = False) -> None:
                        capture_output=True, timeout=10)
 
 
+#: After this many CONSECUTIVE failed restart attempts, stop trying and just flag it. Without a
+#: cap, an agent/daemon that crashes right back on every relaunch (bad command, missing API key,
+#: a bug that reproduces instantly) gets killed + recreated forever, every interval, in total
+#: silence — indistinguishable from "working normally" unless you're watching the log. A stuck
+#: entry is surfaced once (not spammed) so it's visible in the log / a future status report,
+#: and stays down until a human intervenes (fix it, then hit restart from the dashboard, which
+#: always retries regardless of this cap).
+MAX_CONSECUTIVE_ATTEMPTS = 8
+
+
 def tick(cfg: dict) -> int:
     """One supervision pass. Returns the number of restarts performed."""
     tmux_bin = shutil.which(cfg.get("tmux_bin", "tmux")) or "tmux"
@@ -115,6 +125,13 @@ def tick(cfg: dict) -> int:
             attempts.pop(name, None)          # recovered → clear the failure counter
             continue
         n = attempts.get(name, 0) + 1
+        if n > MAX_CONSECUTIVE_ATTEMPTS:
+            if n == MAX_CONSECUTIVE_ATTEMPTS + 1:     # log the give-up exactly once, not every pass
+                _log(f"agent '{name}' still dead after {MAX_CONSECUTIVE_ATTEMPTS} attempts → "
+                     f"giving up automatic restarts; needs manual attention "
+                     f"(restart it from the dashboard once fixed)")
+            attempts[name] = n
+            continue
         attempts[name] = n
         # First failure → plain restart (send-keys into the session). If it's STILL dead next pass,
         # the pane is stuck (a half-dead agent + a bare shell), so kill + recreate the session for a
@@ -129,10 +146,22 @@ def tick(cfg: dict) -> int:
         spec = next((x for x in cfg.get("daemons", []) if x.get("name") == d["name"]), {})
         if not spec.get("enabled", True):
             continue                       # explicitly stopped from the dashboard — don't revive it
+        name = d["name"]
         if not d["up"] and spec.get("restart"):
-            _log(f"daemon '{d['name']}' down → restart")
+            n = attempts.get(name, 0) + 1
+            if n > MAX_CONSECUTIVE_ATTEMPTS:
+                if n == MAX_CONSECUTIVE_ATTEMPTS + 1:
+                    _log(f"daemon '{name}' still down after {MAX_CONSECUTIVE_ATTEMPTS} attempts → "
+                         f"giving up automatic restarts; needs manual attention")
+                attempts[name] = n
+                continue
+            attempts[name] = n
+            _log(f"daemon '{name}' down → restart (attempt {n})")
             subprocess.run(spec["restart"], shell=True, capture_output=True, timeout=30)
             restarts += 1
+        elif d["up"]:
+            attempts.pop(name, None)
+    _save_attempts(attempts)
     return restarts
 
 
